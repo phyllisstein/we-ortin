@@ -1,0 +1,14 @@
+{
+    "editor.tabSize": 4,
+    "search.exclude": {
+        "**/node_modules": true,
+        "**/.yarn": true
+    },
+    "[rust]": {
+        "editor.defaultFormatter": "rust-lang.rust-analyzer",
+        "editor.formatOnSave": true
+    },
+    "rust-analyzer.inlayHints.closingBraceHints.enable": false,
+    "rust-analyzer.inlayHints.maxLength": 10,
+    "rust-analyzer.inlayHints.typeHints.location": "end_of_line",
+}
