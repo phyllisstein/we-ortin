@@ -46,6 +46,101 @@ struct Config {
     id2label: BTreeMap<usize, String>,
 }
 
+/// One entity span, recovered from the source text rather than rebuilt from
+/// WordPiece spelling.
+struct Entity {
+    text: String,
+    kind: String,
+}
+
+/// Walk one sentence's `[sequence, labels]` logits and collect BIO spans.
+///
+/// Two merges happen here, and they are different problems:
+///   1. subword → word: `N ##k ##rum ##ah` is one word with one tag.
+///   2. word → span:    `B-LOC I-LOC` joins two words into one entity.
+///
+/// Byte offsets from the encoding let us slice `source` directly, so the
+/// reassembled text keeps its original casing and punctuation.
+fn entities(
+    encoding: &Encoding,
+    sentence: ArrayView2<f32>,
+    id2label: &BTreeMap<usize, String>,
+    source: &str,
+) -> Vec<Entity> {
+    let specials = encoding.get_special_tokens_mask();
+    let offsets = encoding.get_offsets();
+    let tokens = encoding.get_tokens();
+
+    let mut out: Vec<Entity> = Vec::new();
+    // The span currently being built: (kind, start byte, end byte).
+    let mut open: Option<(String, usize, usize)> = None;
+
+    for (position, lane) in sentence.axis_iter(Axis(0)).enumerate() {
+        // `[CLS]`, `[SEP]`, and `[PAD]` stand for nothing in the source text.
+        if specials[position] == 1 || encoding.get_attention_mask()[position] == 0 {
+            continue;
+        }
+
+        let Some(id) = argmax(lane) else { continue };
+        let label = &id2label[&id];
+        let (start, end) = offsets[position];
+        let continues_word = tokens[position].starts_with("##");
+        let _fragment = &source[start..end];
+
+        if continues_word {
+            if let Some((kind, running_start, _)) = open {
+                open = Some((kind, running_start, end));
+            }
+            continue;
+        }
+
+        if label.starts_with("O") {
+            if let Some((kind, running_start, running_end)) = open {
+                let text = &source[running_start..running_end];
+                let entity = Entity {
+                    kind,
+                    text: text.into(),
+                };
+                out.push(entity);
+                open = None;
+            };
+            continue;
+        }
+
+        if label.starts_with("B") {
+            if let Some((kind, running_start, running_end)) = open {
+                let text = &source[running_start..running_end];
+                let entity = Entity {
+                    kind,
+                    text: text.into(),
+                };
+                out.push(entity);
+            };
+
+            let entity_kind = label.strip_prefix("B-").unwrap();
+            open = Some((entity_kind.into(), start, end));
+            continue;
+        }
+
+        if label.starts_with("I") {
+            let entity_kind = label.strip_prefix("I-").unwrap();
+
+            match open {
+                // The classifier reported that we're inside an entity, but no
+                // entity was previously extracted. Open a new span.
+                None => {
+                    open = Some((entity_kind.into(), start, end));
+                    continue;
+                }
+                Some((running_entity, running_start, _)) => {
+                    open = Some((running_entity, running_start, end));
+                }
+            };
+        }
+    }
+    out
+}
+
 fn main() -> Result<()> {
     // Tracing goes to stderr so structured logs don't mix with any stdout
     // output (e.g. health-check scripts that parse the server's stdout).
@@ -105,20 +200,8 @@ fn main() -> Result<()> {
         let sentence = logits.index_axis(Axis(0), i);
 
         println!("\n{}", inputs[i]);
-        for (position, lane) in sentence.axis_iter(Axis(0)).enumerate() {
-            // Skip padded positions: the model emitted logits for them, but they
-            // stand for nothing in the source text.
-            if encoding.get_attention_mask()[position] == 0 {
-                continue;
-            }
-
-            let token = &encoding.get_tokens()[position];
-            let label: String = match argmax(lane) {
-                Some(id) => id2label.get(&id).unwrap().into(),
-                None => "undefined".into(),
-            };
-
-            println!("\t{token}\t{label}");
+        for entity in entities(encoding, sentence, &id2label, inputs[i]) {
+            println!("\t{}\t{}", entity.text, entity.kind);
         }
     }
 

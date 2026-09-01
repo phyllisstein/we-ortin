@@ -3,6 +3,237 @@
 Running notes. Newest at the top.
 
 ---
+## 2026-09-01 — `bert-base-NER` end to end: tensors in, entities out
+
+First complete pipeline. Two sentences → tokenizer → three `[batch, sequence]`
+int64 tensors → `session.run` → `[batch, sequence, labels]` logits → decoded
+BIO spans. Everything below was learned by breaking it.
+
+### The theme: the tokenizer's configuration is part of the model's contract
+
+This bit three times, and the pattern is worth naming. A tokenizer is not a
+generic text-to-numbers function. `tokenizer.json` encodes decisions that the
+*model weights were trained under*, and copying inference code between models
+transplants assumptions that do not survive the move.
+
+**Failure 1 — loud.** `encode_batch` returned ragged encodings (9 and 23
+tokens), so no rectangle described them:
+
+```
+shape [2, 9] (18 elements) is different from the length of the data provided (32 elements)
+```
+
+`bert-base-NER`'s `tokenizer.json` has `padding: null`. Through serde that
+becomes `Tokenizer.padding = None`, and `encode_batch` then *batches without
+padding*. The upstream `ort` MiniLM example carries a comment asserting that
+`encode_batch` pads — true only when the tokenizer's own padding config is
+populated. Fix: `tokenizer.with_padding(Some(PaddingParams::default()))`
+(default strategy is already `BatchLongest`).
+
+**Failure 2 — silent, and the dangerous one.** `encode_batch(inputs, false)`
+sets `add_special_tokens: false`, so no `[CLS]`/`[SEP]`. Every token in both
+sentences then decoded as `O`. Shapes correct, dtypes correct, masks correct,
+no panic, no warning — just uniformly plausible wrong answers.
+
+*Why* it collapses is the good part. Softmax forces attention mass to sum to 1
+with no option to abstain, so heads with nothing useful to attend to dump their
+mass onto the semantically empty `[CLS]`/`[SEP]` positions — **attention
+sinks**. Clark et al. (2019) found >50% of attention in many heads lands on
+`[SEP]`. Remove them and that mass redistributes onto real tokens, shifting
+every hidden state off the manifold the classification head was fit to. The
+head collapses toward the majority class, which in NER is `O` (~80–90% of real
+tokens).
+
+The loud failure is the lucky one.
+
+### Tensors in, tensors out
+
+The inputs are tensors too, not just the outputs — `input_ids`,
+`attention_mask`, `token_type_ids`, all `[batch, sequence]` int64. Flowing
+tensors the whole way down.
+
+`input_ids` is the one stream in the forward pass that is **coordinates, not
+values**: row numbers into a 30,522-line `vocab.txt`, consumed by ONNX's
+`Gather` op. Arithmetic on them is meaningless. Every other tensor holds
+quantities.
+
+`attention_mask` does double duty. Going in, it becomes an additive `0` /
+`-10000` bias on attention *scores* before softmax, so `exp(-10000) ≈ 0` and
+padded positions contribute nothing. Coming out, it is the filter marking which
+positions were real.
+
+`token_type_ids` is BERT's segment embedding, left over from next-sentence-
+prediction pretraining: all zeros for a single sentence, `0`s then `1`s for a
+pair. ONNX Runtime requires *every* declared input bound — there are no
+defaults — so it must be supplied even when it is entirely zeros.
+
+Contrast worth keeping, since crossing domains is the point of this repo:
+
+| | inputs | outputs |
+| --- | --- | --- |
+| `bert-base-NER` | 3 (`input_ids`, `attention_mask`, `token_type_ids`) | 1 (`logits`) |
+| `all-MiniLM-L6-v2` | 2 (no `token_type_ids` — the export dropped it) | 2 (`last_hidden_state` + pooled) |
+
+Same `ort` surface, different contract. The plumbing transfers; the contract
+does not.
+
+### Flat buffer + shape tuple
+
+`TensorRef::from_array_view((shape, &[T]))` — the buffer holds values, the shape
+holds the interpretation. A flat buffer can only address a *rectangle*, which is
+why padding is mandatory rather than a convenience. `[2,16,9]` has strides
+`[144, 9, 1]`; element `[i][j][k]` lives at `i*144 + j*9 + k`. Slicing and
+transposing are stride manipulations, zero-copy.
+
+Corollary that cost a debugging round: `.iter()` on an `Array3` walks every
+scalar (414 of them), not rows. `index_axis` / `axis_iter` walk *structure*. A
+`zip(masks)` against `.iter()` silently paired logit-scalars with unrelated mask
+values. Collapse `[2,23,9] → [2,23]` with argmax first, and then the mask lines
+up shape-for-shape.
+
+### Decoding logits
+
+The exported graph ends at logits — softmax was deliberately left out, because
+argmax is monotonic under softmax and the probabilities are never needed.
+
+`f32` is not `Ord`, only `PartialOrd`: NaN breaks both totality and
+reflexivity, so `max_by_key` will not compile. Use
+`max_by(|a, b| a.total_cmp(b))` — IEEE 754 totalOrder, cannot panic — rather
+than `partial_cmp().unwrap()`. Note `max_by` returns the **last** maximum on
+ties while `min_by` returns the first.
+
+Label names come from `config.json`'s `id2label`. Deserializing it as
+`BTreeMap<usize, String>` works even though JSON object keys are always strings,
+because serde's integer deserializers accept the string form *in key position*.
+`BTreeMap` iterates in key order, so `.into_values().collect()` would give a
+dense `Vec<String>` if the ordering is ever needed.
+
+One misread worth recording: `"0": "O"` is the **letter O**, for *Outside*, not
+the digit zero. Slicing it off with `s![.., 1..]` made every lane 8 wide, so
+argmax returned 0–7 meaning labels 1–8 — every tag silently shifted by one. It
+*looked* better only because removing `O` forces every token to claim some
+entity type.
+
+### Two merges, one traversal
+
+`entities()` reconstructs spans from per-token tags. Two distinct concerns, both
+run-detection over the *same* sequence axis — they are not two ndarray axes, and
+`Axis(1)` (labels) is already collapsed by argmax before any of this runs:
+
+1. **subword → word.** `Nkrumah` tokenizes to `N ##k ##rum ##ah`. Four
+   positions, four independent tags, one word. Under HuggingFace's `first`
+   strategy a `##` token never makes a decision — it just extends whatever the
+   word's first subword decided. This check must come *before* the BIO dispatch,
+   since the `##` token's own label is noise being deliberately discarded.
+2. **word → span.** `B-ORG I-ORG` joins `Osagyefo` and `Studios` into one
+   entity.
+
+The test sentence exercises three distinct paths:
+
+| span | merged by |
+| --- | --- |
+| `Kwame Nkrumah` | `I-PER` **and** `##` continuation |
+| `Osagyefo Studios` | `I-ORG` only |
+| `Sekondi` / `Takoradi` | neither — see below |
+
+Missing the `I-` branch entirely still produced `Kwame Nkrumah` correctly, via
+the `##` path, which is exactly the kind of coincidence that hides a bug.
+`Osagyefo Studios` — two whole words, no `##` anywhere — is what exposed it.
+
+Use `Encoding::get_offsets()` (byte offsets into the original string) rather
+than reassembling WordPiece spelling. Slicing `source[start..end]` preserves
+casing and punctuation for free; a detokenizer would have to *guess* whether to
+put spaces around a hyphen.
+
+### `Sekondi-Takoradi`: not a decode bug
+
+The model emits `Sekondi → B-LOC`, `- → O`, `Ta → B-LOC`. Two separate `B-LOC`
+spans is the correct reading of that tag sequence under any BIO decoder,
+HuggingFace's included. The decode is faithful; the *prediction* is what splits.
+
+Why: this is a token-classification head with **no CRF layer**, so every
+position argmaxes independently and nothing enforces that a well-formed BIO
+sequence comes out. `B-LOC O B-LOC` inside one orthographic word is not
+forbidden by anything.
+
+> **CRF (Conditional Random Field).** A layer bolted onto the *output* of a
+> token classifier to make tag decisions depend on each other. It adds a learned
+> **transition matrix** — 9×9 for this label set — where `T[a][b]` scores how
+> plausible tag `b` is immediately after tag `a`. You then stop arg-maxing each
+> position alone and instead score whole tag *sequences*:
+>
+> ```
+> score(tags) = Σᵢ emission[i][tagᵢ] + Σᵢ transition[tagᵢ₋₁][tagᵢ]
+> ```
+>
+> The emissions are the existing logits; the transitions are new parameters.
+> Finding the best sequence looks like it needs 9²³ ≈ 10²¹ evaluations, but
+> **Viterbi** does it in O(n·k²) — 23 × 81 steps — because the score decomposes
+> into terms spanning only two adjacent positions, so the best path *ending in
+> tag b at position i* depends only on the best path ending in each tag at
+> `i-1`. Same dynamic program as the forward algorithm in HMMs.
+>
+> Nobody hand-writes BIO's grammar: fine-tuning discovers that `T[O][I-LOC]`
+> should be strongly negative (you cannot be Inside a location you never Began)
+> and that `T[B-PER][I-PER]` is favorable.
+>
+> A CRF would not automatically fix `Sekondi-Takoradi`, but it changes the
+> calculus — `B-LOC O B-LOC` would pay a transition penalty that
+> `B-LOC I-LOC I-LOC` does not, so the model would have to be *confident* about
+> the `O` to keep it, not merely ahead by a hair.
+>
+> Why `bert-base-NER` has none, two separate reasons: (1) CRFs were near
+> universal atop BiLSTMs (2015–2018) because an LSTM's state at position *i* is
+> genuinely weak on what was tagged at `i-1`; self-attention already gives every
+> position a view of the whole sequence, so the emissions carry much of that
+> consistency themselves and the measured gain over BERT is typically under a
+> point of F1. (2) Viterbi is a loop with data-dependent control flow, awkward
+> to express as ONNX ops, so exports routinely drop it and leave decoding to the
+> host — the recurring shape of this whole exercise: **the graph gives you
+> emissions; structured decoding is your problem.**
+
+Punctuation is overwhelmingly `O` in CoNLL-2003, a
+lexical prior strong enough to override span context; that `O` breaks the
+contextual frame, so `Ta` re-decides from scratch and its prior for a
+capitalized unknown in location context is `B-LOC`.
+
+Related, and encouraging: *Osagyefo Studios* is fictional and neither word is
+in-vocab as a unit, yet it still classified as `ORG`. The signal is the
+syntactic frame `founded X in Y`, not memorized surface forms. That is the
+whole value of a fine-tuned transformer over a gazetteer.
+
+Merging across the hyphen would be a post-hoc heuristic layered on top — a
+legitimate production move, but it lives strictly *outside* the graph.
+
+### Rust notes
+
+- **`as` is a real conversion**, not TypeScript's erased assertion: it emits a
+  zero/sign-extension instruction and doubles the memory footprint. Prefer
+  `i64::from(x)` for widening — it only compiles when provably lossless.
+- **`&*ids`** converts `Vec<i64> → &[i64]`: `*` names the `Deref::Target` (the
+  unsized `[i64]`) so `&` can bind to it. Needed because `from_array_view` is
+  generic — there is no concrete target type for deref coercion to fire toward.
+- **`&e` in a pattern** *removes* a reference, because patterns mirror
+  constructors: `&` in an expression adds, `&` in a pattern strips. (`e` is
+  already the address; `*e` follows it to read the value.)
+- **`Default::default()`** in struct-update position creates an inference
+  variable `?S: Default`, defers trait selection, and lets the *use site*
+  constrain it. Information flows outward-in.
+- **`Option<T>` vs `T::default()`**: `Option` answers "do you want this at all";
+  `Default` answers "you want it but don't care how." `padding: null` ↔ `None`
+  round-trips through serde with no attribute.
+- **rustc suggestion calibration**: borrow-checker suggestions are purely
+  syntactic lifetime fixes. `MachineApplicable` means "this compiles," not
+  "this is what you meant." Its fix for the `E0716` on chained
+  `from_file(...)?.with_padding(...)` introduced a binding rather than pointing
+  at the actual issue, which is that `with_padding` returns `&mut Self` and so
+  cannot terminate an expression.
+- Filtering padding **first** beats filtering last. Both are safe — padded
+  logits are well-formed `f32`s, nothing crashes either way — but filtering
+  last is a screen at the end of the pipe, and every intermediate stage still
+  saw the padding. Filtering first makes bad states unrepresentable.
+
+---
 ## 2026-08-27 — Aside: a second model exported (`embeddinggemma-export`)
 
 ### A Python dependency conflict, and why Cargo doesn't have them
