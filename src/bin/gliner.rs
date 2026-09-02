@@ -16,12 +16,13 @@
 //! correctly is a precondition for calling it at all.
 
 #![feature(iter_intersperse)]
-
-use std::println;
+#![feature(iter_advance_by)]
 
 use anyhow::{Result, anyhow};
 use ndarray::prelude::*;
 use ort::{session::Session, value::TensorRef};
+use std::collections::HashSet;
+use std::println;
 use tokenizers::{Encoding, Tokenizer};
 
 /// Baked into the exported graph as six `Constant` nodes — `gliner_config.json`
@@ -159,46 +160,56 @@ fn span_indices(num_words: usize) -> (Vec<[i64; 2]>, Vec<bool>) {
 fn encode(tokenizer: &Tokenizer, labels: &[&str], words: &[Word]) -> Result<(Vec<i64>, Vec<i64>)> {
     let mut bracketed_labels: Vec<&str> = Vec::from(labels)
         .into_iter()
-        .intersperse(" <<ENT>> ")
+        .intersperse("<<ENT>>")
         .collect();
-    bracketed_labels.insert(0, " <<ENT>> ");
-    bracketed_labels.push(" <<SEP>> ");
+    bracketed_labels.insert(0, "<<ENT>>");
+    bracketed_labels.push("<<SEP>>");
 
     let tokens: Vec<&str> = bracketed_labels
         .into_iter()
         .chain(words.iter().map(|w| w.text.as_str()))
         .collect();
 
-    let input_ids = tokenizer.encode(tokens, true).map_err(|e| anyhow!(e))?;
-    let _wm: Vec<u32> = input_ids
-        .get_word_ids()
-        .into_iter()
-        .filter(|&i| i.is_some())
-        .map(|&i| i.unwrap())
-        .collect();
+    let encoding = tokenizer.encode(tokens, true).map_err(|e| anyhow!(e))?;
 
-    let mut words_mask: Vec<usize> = Vec::new();
-    let character_re = regex::regex!(r"([^\w])(\w+)");
-    for (idx, token) in input_ids.get_tokens().iter().enumerate() {
-        let fields = character_re.captures(token).unwrap();
+    // `<<ENT>>` before each label, plus a trailing `<<SEP>>`: the elements of
+    // `tokens` that precede the sentence itself.
+    let preamble = labels.len() * 2 + 1;
 
-        if fields.len() < 2 {
-            let word = fields.get(0).unwrap().as_str();
-            println!("no_match: {:?}", word);
+    let mut words_mask: Vec<i64> = Vec::with_capacity(encoding.len());
+    // TODO(human): emit one value per token position from `encoding.get_word_ids()`.
+    // 0 for `None`, 0 for preamble elements, 0 for repeated ids, and
+    // `id - preamble + 1` for the first token of each sentence word.
+
+    let mut active_id = -1i64;
+    let word_ids = encoding.get_word_ids();
+
+    for (idx, wid) in word_ids.iter().copied().enumerate() {
+        if idx < preamble {
             words_mask.push(0);
             continue;
         }
 
-        let subword = fields.get(1).unwrap_or();
-        println!("is_match: {:?}", subword);
-        for (idx, word) in words.iter().enumerate() {
-            if word.text.starts_with(subword.as_str()) {
-                words_mask.push(idx + 1);
+        if let Some(id) = wid {
+            let id64 = id as i64;
+            let tk = id64 - preamble as i64 + 1;
+
+            if tk == active_id {
+                words_mask.push(0);
+                continue;
             }
+
+            active_id = tk;
+            words_mask.push(tk);
+        } else if wid.is_none() {
+            words_mask.push(0);
+            continue;
         }
     }
 
-    todo!()
+    let input_ids = encoding.get_ids().iter().map(|&o| i64::from(o)).collect();
+
+    Ok((input_ids, words_mask))
 }
 
 fn main() -> Result<()> {
