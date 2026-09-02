@@ -181,29 +181,31 @@ fn encode(tokenizer: &Tokenizer, labels: &[&str], words: &[Word]) -> Result<(Vec
     // 0 for `None`, 0 for preamble elements, 0 for repeated ids, and
     // `id - preamble + 1` for the first token of each sentence word.
 
-    let mut active_id = -1i64;
+    let mut active_id: Option<i64> = None;
     let word_ids = encoding.get_word_ids();
 
-    for (idx, wid) in word_ids.iter().copied().enumerate() {
-        if idx < preamble {
-            words_mask.push(0);
-            continue;
-        }
-
+    for wid in word_ids.iter().copied() {
         if let Some(id) = wid {
             let id64 = id as i64;
-            let tk = id64 - preamble as i64 + 1;
 
-            if tk == active_id {
+            if id64 < preamble as i64 {
                 words_mask.push(0);
                 continue;
             }
 
-            active_id = tk;
+            let tk = id64 - preamble as i64 + 1;
+
+            if let Some(aid) = active_id {
+                if tk == aid {
+                    words_mask.push(0);
+                    continue;
+                }
+            }
+
             words_mask.push(tk);
-        } else if wid.is_none() {
+            active_id = Some(tk);
+        } else {
             words_mask.push(0);
-            continue;
         }
     }
 
