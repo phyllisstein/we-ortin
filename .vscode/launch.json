@@ -17,6 +17,18 @@
             "args": []
         },
         {
+            "name": "Debug executable 'gliner'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "run",
+                    "--bin=gliner"
+                ]
+            },
+            "args": []
+        },
+        {
             "name": "Debug unit tests in executable 'ort-with-claude'",
             "type": "lldb",
             "request": "launch",

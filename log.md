@@ -3,6 +3,196 @@
 Running notes. Newest at the top.
 
 ---
+## 2026-09-01 — GLiNER: the label set moves from compile time to run time
+
+Probed `onnx-community/gliner_small-v2.1` before writing any Rust, because the
+exported graph's shape annotations turned out to be *wrong* and building a
+decoder against them would have failed silently.
+
+### The core move
+
+`bert-base-NER` bakes 9 labels into the final linear layer's weight matrix.
+Those 9 are all it can ever say. GLiNER instead takes the entity types as
+**input text**, in the same sequence as the sentence:
+
+```
+[CLS] <<ENT>> person <<ENT>> organization <<ENT>> location <<SEP>> Kwame Nkrumah founded …
+```
+
+Both the type names and the sentence pass through one encoder in one forward
+pass, so `person` and `Nkrumah` end up as contextual embeddings in a *shared*
+space, and classification becomes a **dot product** between a span embedding and
+a type embedding. Structurally the same trick as CLIP, and as the embedding
+model exported earlier: replace a fixed classification head with a similarity
+computation in a shared space.
+
+The consequence is that there is **no `id2label`**. The label set is supplied at
+call time; its index in the input list is its index in the output tensor.
+
+Demonstrated on one sentence, same weights, no retraining:
+
+| labels supplied | `Kwame Nkrumah` |
+| --- | --- |
+| `person, organization, location` | **person** 0.984 |
+| `person, company, city, political leader` | **political leader** 0.961 |
+
+`political leader` appears in no training taxonomy, yet scores 0.961 — because
+it is encoded *as language* and compared in the shared space. Related labels
+compete: `person` is still arguably correct but sits in a broader region of that
+space than the span embedding. **Label wording is a tuning knob.**
+
+### It is a span model, not a token classifier
+
+Rather than tagging each token and reconstructing spans, GLiNER enumerates
+candidate spans — every contiguous run up to `max_width: 12` words — and scores
+each *(span, type)* pair. The BIO decoder from the previous entry is thrown away
+entirely.
+
+| | `bert-base-NER` | GLiNER |
+| --- | --- | --- |
+| inputs | 3 | **6** |
+| output rank | 3 | **4** |
+| axis 1 | token position | word position |
+| axis 2 | fixed 9 labels | span width |
+| activation | softmax over labels | **sigmoid per (span, type)** |
+| decode | BIO state machine | threshold + overlap resolution |
+
+Sigmoid rather than softmax is the sharpest difference. Softmax forces exactly
+one winner per token; independent sigmoids let a span score high for two types
+or for none.
+
+> **Sigmoid.** `σ(x) = 1 / (1 + e^-x)` — squashes one logit into `(0, 1)`,
+> independently of every other logit. Softmax normalizes a *vector* so it sums
+> to 1, coupling the classes into a competition; sigmoid is applied
+> element-wise, so nothing is coupled. That difference is the whole reason
+> GLiNER can emit overlapping entities and BIO cannot: "is this span a person?"
+> and "is this span a political leader?" are separate yes/no questions, not
+> slices of one probability budget. It also means the scores are **not**
+> probabilities over a label set and will not sum to 1 — comparing them across
+> types is a threshold decision, not an argmax. `σ(0) = 0.5`, so a threshold of
+> 0.5 is exactly "positive logit," and the usual 0.3 is a deliberate lean
+> toward recall.
+
+Only 3 of 108 (span, type) pairs cleared 0.3 on the test sentence — nothing has
+to win, which is the structural opposite of the attention-sink problem where
+softmax *must* put its mass somewhere.
+
+Nested and overlapping entities become expressible, which BIO structurally
+cannot represent.
+
+### `Sekondi-Takoradi` stops being a problem
+
+It scores 0.962 as a single `location`. Not better decoding — the span was never
+split into per-token decisions. Whitespace splitting makes `Sekondi-Takoradi`
+**one word**, so the model was asked one question and gave one answer. The
+hyphen failure from the BIO model does not get solved; it ceases to exist.
+
+### The exporter's shape annotations are wrong
+
+The graph declares `logits` as `[batch_size, sequence_length, num_spans,
+num_classes]`. Empirically it is:
+
+```
+logits [1, 8, 12, 3]
+        │  │   │  └── num_classes  (labels, in the order supplied)
+        │  │   └───── max_width    (index w means w+1 words long)
+        │  └───────── num_words    (8 whitespace words — NOT sequence_length, which is 24)
+        └──────────── batch
+```
+
+`sequence_length` (24 subword tokens) and `num_words` (8) are different numbers,
+and the annotation names the wrong one. Three of the five declared outputs are
+also unnamed leaked intermediates (`2973`, `onnx::Shape_3287`) — numeric names
+are ONNX's fallback when a node has none, a tell that the export was traced from
+PyTorch without an explicit output spec. Always fetch outputs by name.
+
+**Verify the graph empirically before writing a decoder against its metadata.**
+
+### The six inputs
+
+| name | shape | dtype | construction |
+| --- | --- | --- | --- |
+| `input_ids` | `[batch, seq]` | int64 | `<<ENT>>`-separated types, `<<SEP>>`, then words |
+| `attention_mask` | `[batch, seq]` | int64 | as usual |
+| `words_mask` | `[batch, seq]` | int64 | **1-based** word index on each word's *first* subword, 0 elsewhere |
+| `text_lengths` | `[batch, 1]` | int64 | word count |
+| `span_idx` | `[batch, W*12, 2]` | int64 | `[start, start+w]`, **inclusive** |
+| `span_mask` | `[batch, W*12]` | **bool** | `end < num_words` |
+
+`span_idx` is laid out as all 12 widths for word 0, then all 12 for word 1, so
+flat index `s*12 + w` corresponds to `logits[s][w]` — the same enumeration in
+two shapes. 96 candidates for 8 words, of which 36 are valid; `span_mask` culls
+the rest.
+
+Note `span_mask` is **BOOL**, the first non-int64 input in this project.
+
+### `max_width: 12` is frozen by the export, not by the architecture
+
+Three separate layers, worth keeping apart:
+
+1. **Architecturally it is free.** `span_mode: markerV0` builds a span
+   representation from its *endpoint* hidden states only — `project_start` and
+   `project_end` (768→2048→512 each), then `out_project`. Grepping the
+   initializers confirms **no weight has a dimension of 12**; there is no width
+   embedding. Span length never enters as a learned parameter, which is why
+   `max_width` can be a hyperparameter rather than a cost.
+2. **Statistically it is a training property.** The model only saw spans up to
+   12 words, so calibration beyond that is unknown.
+3. **In this artifact it is hard-coded regardless.** The graph contains six
+   Constant nodes equal to 12, baked in by tracing.
+
+So `gliner_config.json`'s `max_width` is **descriptive, not prescriptive** —
+editing it changes nothing. Same tracing artifact that produced the numeric
+output names and the mislabeled `sequence_length` axis: `torch.onnx.export`
+records the ops that actually ran, so any Python-level constant hardens into a
+structural property of the file. A configurable hyperparameter upstream becomes
+immutable downstream.
+
+**After export, the graph is the authority, not the config.**
+
+### Half the domain logic moved to *before* the call
+
+`bert-base-NER` put all the domain knowledge in the decoder. GLiNER requires
+knowing the span-enumeration convention just to *call* the model. Same `ort`
+API, but the work migrated from after the forward pass to before it — the
+sharpest instance yet of where the tooling transfers and where it does not.
+
+### SentencePiece inverts the WordPiece convention
+
+The encoder is `microsoft/deberta-v3-small`, so tokenization is
+SentencePiece/Unigram, not WordPiece. There is no `##`. Instead `▁` (U+2581
+LOWER ONE EIGHTH BLOCK, not an underscore) marks a **word start**, so
+continuations are identified by *lacking* the prefix:
+
+```
+ 16  45236  ▁Sek      words_mask 7
+ 17  78557  ondi      words_mask 0
+ 18    271  -         words_mask 0
+ 19   1193  T         words_mask 0
+```
+
+`starts_with("##")` becomes `!starts_with('▁')`. Same information, opposite
+polarity. The character is chosen for being absent from natural text, which
+makes detokenization losslessly reversible by replacing `▁` with a space —
+WordPiece needs explicit rules for punctuation spacing instead.
+
+The zeros on positions 17–21 are not padding; they mean "not a word start."
+
+### Housekeeping
+
+- `tokenizer.json` again has `padding: null`. Expected now.
+- Reference implementation installed into a **throwaway scratchpad venv**, not
+  the project venv: `gliner` pulls `transformers 5.13.1`, which is exactly the
+  version that broke `optimum-onnx` in the 2026-08-27 entry. The project venv
+  still has no `pyproject.toml` recording its `<4.58` pin, so nothing would have
+  caught the violation.
+- Ground truth saved to `tests/fixtures/gliner-small-v2.1.json` — the six input
+  tensors Python fed the graph plus the three expected entities. Assert Rust
+  inputs match *before* running inference, so bugs localize to construction
+  rather than surfacing as mysterious scores. (`onnx/` is gitignored, hence
+  `tests/`.)
+
+---
 ## 2026-09-01 — `bert-base-NER` end to end: tensors in, entities out
 
 First complete pipeline. Two sentences → tokenizer → three `[batch, sequence]`
