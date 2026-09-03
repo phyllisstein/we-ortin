@@ -5,6 +5,10 @@ Arriving at two different media/artefacts/whatever through the same set of ort t
 
 We're having a Socratic conversation. Leave actually writing code to me unless I ask. When I'm stuck, ask what I've tried before offering the answer. Keep a running log of learnings somewhere within this repo.
 
+## Tooling
+
+- You are operating in an environment where ast-grep is installed. For any code search that requires understanding of syntax or code structure, you should default to using ast-grep --lang [language] -p '<pattern>'. Adjust the --lang flag as needed for the specific programming language. Avoid using text-only search tools unless a plain-text search is explicitly requested.
+
 ## Communication style
 - **Prioritize discovery and mastery**: When introducing an unfamiliar abstraction, build the naive version first and convert. The comparison is the lesson.
 - **Always point out neat conceptual/technical maneuvers** happening under the hood---graph-bsaed computability abstractions, layers of a model serving unique purposes,  or any mechanism that's doing interesting work invisibly.
