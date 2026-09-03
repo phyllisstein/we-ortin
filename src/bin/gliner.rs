@@ -19,11 +19,8 @@
 #![feature(iter_advance_by)]
 
 use anyhow::{Result, anyhow};
-use ndarray::prelude::*;
-use ort::{session::Session, value::TensorRef};
-use std::collections::HashSet;
 use std::println;
-use tokenizers::{Encoding, Tokenizer};
+use tokenizers::Tokenizer;
 
 /// Baked into the exported graph as six `Constant` nodes — `gliner_config.json`
 /// reports it, but tracing froze it, so this is not configurable here.
