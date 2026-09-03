@@ -19,6 +19,10 @@
 #![feature(iter_advance_by)]
 
 use anyhow::{Result, anyhow};
+use core::num;
+use ndarray::{Array0, Array1, Array2, Array3, Axis, Ix3, Ix4, arr1, arr2, arr3};
+use ort::session::Session;
+use ort::value::TensorRef;
 use std::println;
 use tokenizers::Tokenizer;
 
@@ -243,6 +247,42 @@ fn main() -> Result<()> {
     for e in &fixture.expected {
         println!("  {} \t{} \t{:.3}", e.text, e.label, e.score);
     }
+
+    // Batch size is always 1 here; every tensor's leading dim is that batch.
+    let seq_len = input_ids.len();
+    let num_spans = span_idx.len();
+    let text_lengths_val = [words.len() as i64];
+    let v_attention_mask = Vec::from(attention_mask);
+
+    let a_input_ids = TensorRef::from_array_view(([1, seq_len], &*input_ids))?;
+    let a_attention_mask = TensorRef::from_array_view(([1, seq_len], &*v_attention_mask))?;
+    let a_words_mask = TensorRef::from_array_view(([1, seq_len], &*words_mask))?;
+    let a_text_lengths = TensorRef::from_array_view(([1, 1], &text_lengths_val[..]))?;
+    let a_span_mask = TensorRef::from_array_view(([1, num_spans], &*span_mask))?;
+
+    // build `a_span_idx`, a TensorRef over `span_idx: Vec<[i64; 2]>`
+    let idx = span_idx.into_flattened();
+    let a_span_idx = TensorRef::from_array_view(([1, num_spans, 2], &*idx))?;
+
+    let mut session = Session::builder()?.commit_from_file(format!("{MODEL_DIR}/model.onnx"))?;
+
+    let outputs = session.run(ort::inputs![
+        "input_ids" => a_input_ids,
+        "attention_mask" => a_attention_mask,
+        "words_mask" => a_words_mask,
+        "text_lengths" => a_text_lengths,
+        "span_idx" => a_span_idx,
+        "span_mask" => a_span_mask,
+    ])?;
+
+    // `[batch, words, width, types]`
+    let logits = outputs
+        .get("logits")
+        .ok_or_else(|| anyhow!("model produced no `logits` output"))?
+        .try_extract_array::<f32>()?
+        .into_dimensionality::<Ix4>()?;
+
+    println!("\nlogits shape: {:?}", logits.shape());
 
     Ok(())
 }
