@@ -176,38 +176,27 @@ fn encode(tokenizer: &Tokenizer, labels: &[&str], words: &[Word]) -> Result<(Vec
     // `tokens` that precede the sentence itself.
     let preamble = labels.len() * 2 + 1;
 
-    let mut words_mask: Vec<i64> = Vec::with_capacity(encoding.len());
-    // TODO(human): emit one value per token position from `encoding.get_word_ids()`.
-    // 0 for `None`, 0 for preamble elements, 0 for repeated ids, and
+    // Emit one value per token position from `encoding.get_word_ids()`: 0 for
+    // `None`, 0 for preamble elements, 0 for repeated ids, and
     // `id - preamble + 1` for the first token of each sentence word.
+    let words_mask: Vec<i64> = encoding
+        .get_word_ids()
+        .iter()
+        .copied()
+        .scan(None::<i64>, |active_id, word_id| {
+            let tk = word_id
+                .map(|id| id as i64)
+                .filter(|&id| id >= preamble as i64)
+                .map(|id| id - preamble as i64 + 1)
+                .filter(|&tk| Some(tk) != *active_id);
 
-    let mut active_id: Option<i64> = None;
-    let word_ids = encoding.get_word_ids();
-
-    for wid in word_ids.iter().copied() {
-        if let Some(id) = wid {
-            let id64 = id as i64;
-
-            if id64 < preamble as i64 {
-                words_mask.push(0);
-                continue;
+            if let Some(tk) = tk {
+                *active_id = Some(tk);
             }
 
-            let tk = id64 - preamble as i64 + 1;
-
-            if let Some(aid) = active_id {
-                if tk == aid {
-                    words_mask.push(0);
-                    continue;
-                }
-            }
-
-            words_mask.push(tk);
-            active_id = Some(tk);
-        } else {
-            words_mask.push(0);
-        }
-    }
+            Some(tk.unwrap_or(0))
+        })
+        .collect();
 
     let input_ids = encoding.get_ids().iter().map(|&o| i64::from(o)).collect();
 

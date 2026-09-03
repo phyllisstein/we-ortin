@@ -3,6 +3,35 @@
 Running notes. Newest at the top.
 
 ---
+## 2026-09-02 — `words_mask`: from `for` loop to `Option` chain
+
+`Option<T>` composes like an iterator over 0-or-1 items: `.map`/`.filter` can
+be stacked arbitrarily, each taking an `Option` and returning one, with `None`
+just passing through every later step untouched. That's what let a branching
+loop collapse into one pipeline inside a `scan`:
+
+```rust
+.scan(None::<i64>, |active_id, word_id| {
+    let tk = word_id
+        .map(|id| id as i64)
+        .filter(|&id| id >= preamble as i64)     // drop preamble tokens
+        .map(|id| id - preamble as i64 + 1)       // token space -> word space
+        .filter(|&tk| Some(tk) != *active_id);    // drop repeats
+
+    if let Some(tk) = tk {
+        *active_id = Some(tk);   // only advance state on a real emission
+    }
+    Some(tk.unwrap_or(0))
+})
+```
+
+Two traps: `scan`'s own `Option` return is unrelated to the domain-logic
+`Option` inside the closure — the outer one means "keep iterating," and
+returning `None` there ends the iterator early rather than skipping an
+element. And `Option<T>: PartialEq` (when `T: PartialEq`) makes
+`Some(tk) != *active_id` compile directly, no unwrapping needed.
+
+---
 ## 2026-09-01 — GLiNER: the label set moves from compile time to run time
 
 Probed `onnx-community/gliner_small-v2.1` before writing any Rust, because the
