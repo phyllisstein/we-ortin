@@ -3,6 +3,126 @@
 Running notes. Newest at the top.
 
 ---
+## 2026-09-23 — GLiNER end to end; the optimum task list
+
+### GLiNER gives output
+
+`cargo run --bin gliner` matches the Python fixture exactly:
+
+```text
+Kwame Nkrumah     person        0.984
+Osagyefo Studios  organization  0.929
+Sekondi-Takoradi  location      0.962
+```
+
+The final step was `resolve_overlaps`, which is greedy non-max suppression
+over word ranges. Sort by score, highest first. Keep a candidate only if its
+range doesn't intersect *any* range already kept. Checking only `acc.last()`
+isn't enough, because after the score sort the keepers can be anywhere in the
+sentence. The ranges are inclusive, so two spans are disjoint iff
+`a.end < b.start || b.end < a.start`. The check ignores the label, so each
+span ends up with at most one label.
+
+Across the whole file, the model call is one line. The rest is the tensor
+contract on both sides of it: the word split, `words_mask`, `span_idx`, and
+the threshold plus NMS decode.
+
+### `optimum-cli` task names
+
+These are Hugging Face pipeline tasks. At export time, the task picks the model
+**head** and so the graph's input and output names. The same BERT backbone
+exported as `feature-extraction` returns `last_hidden_state`; exported as
+`token-classification`, it returns `logits`.
+
+**Text**
+- `feature-extraction`: text → one hidden-state vector per token, with no head. You do the pooling.
+- `sentence-similarity`: two texts → a similarity score (embeddings, pooling, cosine).
+- `fill-mask`: predict the `[MASK]` token (BERT's pretraining objective).
+- `token-classification`: a label per token (NER, POS). This is `bert-base-NER`.
+- `text-classification`: one label per sequence (sentiment, NLI).
+- `question-answering`: question + context → start and end logits of an extracted span.
+- `multiple-choice`: question + N candidates → a score for each.
+- `text-generation`: decoder-only, autoregressive (GPT, Qwen).
+- `text2text-generation`: encoder + decoder, text to text (T5, BART; translation, summaries).
+
+**Vision**
+- `image-classification`: image → one label.
+- `zero-shot-image-classification`: image + label strings at runtime → scores (CLIP).
+- `object-detection`: image → boxes with classes.
+- `zero-shot-object-detection`: image + text queries → boxes (OWL-ViT).
+- `image-segmentation`: a label per pixel.
+- `semantic-segmentation`: a class per pixel, without telling separate objects apart.
+- `mask-generation`: prompt points or boxes → object masks with no class (SAM).
+- `keypoint-detection`: landmark coordinates (joints, facial points).
+- `depth-estimation`: a depth value per pixel.
+- `masked-im`: reconstruct hidden image patches (a pretraining objective).
+- `image-to-image`: image → transformed image (super-resolution, style transfer).
+
+**Cross-modal**
+- `image-to-text`: captioning (vision encoder → text decoder).
+- `image-text-to-text`: image + prompt → generated text (LLaVA, Qwen-VL).
+- `visual-question-answering`: image + question → a short answer.
+- `document-question-answering`: page image + question → answer span, using OCR text plus its position (LayoutLM).
+- `text-to-image`: diffusion. Exported as several graphs (text encoder, UNet, VAE).
+- `inpainting`: image + mask + prompt → the masked region filled in.
+- `text-to-audio`: text-to-speech and music generation.
+
+**Audio**
+- `automatic-speech-recognition`: audio → transcript (Whisper, wav2vec2).
+- `audio-classification`: one label per clip.
+- `audio-frame-classification`: a label per time frame (voice activity, diarization).
+- `audio-xvector`: a fixed-size speaker embedding for speaker verification.
+
+**Other**
+- `time-series-forecasting`: past values → future values.
+- `reinforcement-learning`: state → action (Decision Transformer).
+
+**Patterns across the list:**
+- "One label for the whole input" and "one label per unit" appear in every
+  modality. The unit changes (token, pixel, audio frame), and the output
+  tensor's shape follows from it.
+- Generation tasks run the model in a loop, so they export as separate
+  encoder and decoder graphs (plus KV-cache inputs and outputs with
+  `-with-past`). The loop isn't in the ONNX file; the caller has to drive it.
+- GLiNER isn't on the list. It's zero-shot token classification with the
+  labels given as input text, which is why its input tensors are built by hand.
+
+---
+## 2026-09-23 — Why the Qwen3-Embedding-4B export was 45 GiB
+
+Source: two bf16 safetensors shards, 4.7G + 2.9G. The index's
+`total_size` is 8,043,548,672 bytes, and 8.04e9 / 2 bytes ≈ **4.02B params**.
+Shards are capped near 5 GB, so the last shard is just whatever is left.
+
+`model.onnx_data` was 45 GiB. The cause is two separate multipliers:
+
+- **×2, from bf16 to FP32.** `optimum-cli` exports FP32 by default. 4.02B × 4
+  bytes ≈ 15 GiB, which matches the sum of the graph's 398 initializers.
+- **×3, from appended stale copies.** An ONNX file is one protobuf, and
+  protobuf can't go past 2 GiB, so weights live in a sidecar. Each initializer
+  holds only an `offset` and `length` into that file. `onnx` *appends* to an
+  existing sidecar, so each re-export into the same directory wrote another
+  full copy and moved the offsets to it. The graph referenced only bytes
+  29.96–44.95 GiB, so the first 30 GiB were orphaned. Nothing errors because
+  `model.onnx` stays consistent. Fix: `rm -rf` the output dir before
+  re-exporting.
+
+Rule of thumb: export size ≈ params × bytes-per-param. If a size isn't a
+clean multiple of the parameter count, something extra is in there.
+
+Also noticed: `architectures: Qwen3ForCausalLM` made optimum infer
+`text-generation-with-past`. The graph has a `position_ids` input and 72
+`present.*` KV-cache outputs, which an embedding model doesn't need.
+
+### Same network, different readout
+
+Qwen3-Embedding is the same network as a Qwen3 LM. Only the reading position
+changes: an LM reads the last token's hidden state to predict the next word,
+and this model reads the same position (the appended `<|endoftext|>`) as the
+embedding. That's the idea behind this repo: ort runs "tensors in, tensors
+out" the same way for BERT-NER, GLiNER, or Qwen. What changes between models
+is the code around the graph: tokenizer quirks, pooling, prefixes.
+
 ## 2026-09-02 — `words_mask`: from `for` loop to `Option` chain
 
 `Option<T>` composes like an iterator over 0-or-1 items: `.map`/`.filter` can

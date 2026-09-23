@@ -16,15 +16,25 @@
 //! correctly is a precondition for calling it at all.
 
 #![feature(iter_intersperse)]
-#![feature(iter_advance_by)]
 
 use anyhow::{Result, anyhow};
-use core::num;
-use ndarray::{Array0, Array1, Array2, Array3, Axis, Ix3, Ix4, arr1, arr2, arr3};
+use ndarray::Ix4;
 use ort::session::Session;
 use ort::value::TensorRef;
-use std::println;
 use tokenizers::Tokenizer;
+
+/// Minimum sigmoid score for a (span, type) pair to be considered at all.
+/// GLiNER's reference decoder default.
+const SCORE_THRESHOLD: f32 = 0.5;
+
+/// A scored candidate entity, before overlap resolution.
+#[derive(Debug, Clone, Copy)]
+struct Candidate {
+    start_word: usize,
+    end_word: usize,
+    label: usize,
+    score: f32,
+}
 
 /// Baked into the exported graph as six `Constant` nodes — `gliner_config.json`
 /// reports it, but tracing froze it, so this is not configurable here.
@@ -204,12 +214,92 @@ fn encode(tokenizer: &Tokenizer, labels: &[&str], words: &[Word]) -> Result<(Vec
     Ok((input_ids, words_mask))
 }
 
+/// Sigmoid activation: GLiNER scores each (span, type) pair independently —
+/// a span can plausibly match no label or, in principle, more than one — so
+/// there's no softmax-style competition *across types* the way `bert-base-NER`
+/// competes across BIO tags. Only overlap resolution (below) makes spans
+/// compete, and it competes on (start, end) alone, blind to type.
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+/// Walk every `(start_word, width, type)` triple in `logits`, applying sigmoid
+/// and keeping only those above [`SCORE_THRESHOLD`] whose span survives
+/// `span_mask` (i.e. doesn't run past the sentence).
+///
+/// `logits` and `span_mask` share the same flat `(start_word, width)` grid —
+/// `span_mask[s * MAX_WIDTH + w]` gates `logits[0][s][w][_]` — which is exactly
+/// the correspondence `span_indices`'s doc comment sets up.
+fn gather_candidates(logits: &ndarray::ArrayView4<f32>, span_mask: &[bool]) -> Vec<Candidate> {
+    let (_, num_words, num_widths, num_types) = logits.dim();
+    let mut candidates = Vec::new();
+
+    for start_word in 0..num_words {
+        for width in 0..num_widths {
+            let flat = start_word * num_widths + width;
+            if !span_mask[flat] {
+                continue;
+            }
+            let end_word = start_word + width;
+            for label in 0..num_types {
+                let score = sigmoid(logits[[0, start_word, width, label]]);
+                if score > SCORE_THRESHOLD {
+                    candidates.push(Candidate {
+                        start_word,
+                        end_word,
+                        label,
+                        score,
+                    });
+                }
+            }
+        }
+    }
+
+    candidates
+}
+
+/// Resolve overlapping candidates to GLiNER's final entity list.
+///
+/// GLiNER's reference decoder treats this as greedy non-max suppression over
+/// word ranges: sort every above-threshold `(span, type)` candidate by score
+/// descending, then walk the list keeping a candidate only if its word range
+/// doesn't intersect any range already kept. A span that overlaps a
+/// higher-scoring keeper is dropped outright — even a different label doesn't
+/// save it, since the check is on `(start_word, end_word)` alone.
+///
+/// The winners are re-sorted by `start_word` at the end, so entities print in
+/// reading order (the reference decoder does the same).
+fn resolve_overlaps(mut candidates: Vec<Candidate>) -> Vec<Candidate> {
+    // `total_cmp` rather than `partial_cmp().unwrap()`: a total order on f32
+    // (NaN included), so there's no panic path to reason about.
+    candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
+
+    // Plain data massage. Every candidate is checked against *all* keepers,
+    // not just the last one pushed: after sorting by score, keepers can be
+    // anywhere in the sentence, so `acc.last()` has no special meaning.
+    // Ranges are inclusive, so two spans are disjoint iff one ends strictly
+    // before the other starts. An identical range with a different label
+    // counts as overlapping, so each span gets at most one label.
+    let mut kept: Vec<Candidate> = Vec::new();
+    for c in candidates {
+        let overlaps = kept
+            .iter()
+            .any(|k| !(c.end_word < k.start_word || k.end_word < c.start_word));
+        if !overlaps {
+            kept.push(c);
+        }
+    }
+
+    kept.sort_by_key(|c| c.start_word);
+    kept
+}
+
 fn main() -> Result<()> {
     let raw = std::fs::read_to_string("./tests/fixtures/gliner-small-v2.1.json")?;
     let fixture: Fixture = serde_json::from_str(&raw)?;
 
     let text = fixture.text.as_str();
-    let labels = ["person", "organization", "location"];
+    let labels: Vec<&str> = fixture.labels.iter().map(String::as_str).collect();
 
     let words = split_words(text);
     let (span_idx, span_mask) = span_indices(words.len());
@@ -252,10 +342,9 @@ fn main() -> Result<()> {
     let seq_len = input_ids.len();
     let num_spans = span_idx.len();
     let text_lengths_val = [words.len() as i64];
-    let v_attention_mask = Vec::from(attention_mask);
 
     let a_input_ids = TensorRef::from_array_view(([1, seq_len], &*input_ids))?;
-    let a_attention_mask = TensorRef::from_array_view(([1, seq_len], &*v_attention_mask))?;
+    let a_attention_mask = TensorRef::from_array_view(([1, seq_len], &*attention_mask))?;
     let a_words_mask = TensorRef::from_array_view(([1, seq_len], &*words_mask))?;
     let a_text_lengths = TensorRef::from_array_view(([1, 1], &text_lengths_val[..]))?;
     let a_span_mask = TensorRef::from_array_view(([1, num_spans], &*span_mask))?;
@@ -275,7 +364,17 @@ fn main() -> Result<()> {
         "span_mask" => a_span_mask,
     ])?;
 
-    // `[batch, words, width, types]`
+    // `[batch, words, width, types]`: 8 words × 12 widths × 3 types = 288 scores
+    //
+    // "Why logits's last dimension is 3: it's not num_types compiled into the
+    // graph, it's num_types as it fell out of this specific input's label
+    // count."
+    //
+    //
+    // ""That's also, not coincidentally, most of why interpretability research on
+    // transformers is hard — 'where is the fact stored' doesn't have a stable
+    // answer when storage and computation are the same operation, running on
+    // data that's mixed in with the query."
     let logits = outputs
         .get("logits")
         .ok_or_else(|| anyhow!("model produced no `logits` output"))?
@@ -283,6 +382,15 @@ fn main() -> Result<()> {
         .into_dimensionality::<Ix4>()?;
 
     println!("\nlogits shape: {:?}", logits.shape());
+
+    let candidates = gather_candidates(&logits.view(), &span_mask);
+    let entities = resolve_overlaps(candidates);
+
+    println!("\ndecoded entities:");
+    for c in &entities {
+        let text_span = &text[words[c.start_word].start..words[c.end_word].end];
+        println!("  {text_span} \t{} \t{:.3}", labels[c.label], c.score);
+    }
 
     Ok(())
 }
