@@ -1,12 +1,11 @@
-mod sem;
-
-use std::collections::BTreeMap;
+#![allow(unused)]
 
 use anyhow::Result;
 use ndarray::prelude::*;
 use ndarray::s;
 use ort::{session::Session, value::TensorRef};
 use serde_json;
+use std::collections::BTreeMap;
 use tokenizers::{Encoding, PaddingParams, Tokenizer};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
